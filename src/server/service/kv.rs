@@ -42,7 +42,7 @@ use tikv_util::mpsc::batch::{unbounded, BatchCollector, BatchReceiver, Sender};
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::Scheduler;
 use tokio_threadpool::{Builder as ThreadPoolBuilder, ThreadPool};
-use txn_types::{self, Key};
+use txn_types::{self, Key, TimeStamp};
 
 const GRPC_MSG_MAX_BATCH_SIZE: usize = 128;
 const GRPC_MSG_NOTIFY_SIZE: usize = 8;
@@ -1584,11 +1584,34 @@ fn future_raw_delete_range<E: Engine, L: LockManager>(
 
 // unimplemented
 fn future_ver_get<E: Engine, L: LockManager>(
-    _storage: &Storage<E, L>,
-    mut _req: VerGetRequest,
+    storage: &Storage<E, L>,
+    mut req: VerGetRequest,
 ) -> impl Future<Item = VerGetResponse, Error = Error> {
-    let resp = VerGetResponse::default();
-    future::ok(resp)
+    let version: TimeStamp = req.get_start_version().into();
+    storage
+        .get(
+            req.take_context(),
+            Key::from_raw(req.get_key()),
+            version.clone(),
+        )
+        .then(|v| {
+            let mut resp = VerGetResponse::default();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else {
+                match v {
+                    Ok(Some(val)) => {
+                        let mut ver_value = VerValue::default();
+                        ver_value.set_value(val);
+                        ver_value.set_version(u64::from(version));
+                        resp.set_value(ver_value);
+                    }
+                    Ok(None) => resp.set_not_found(true),
+                    Err(e) => resp.set_error(VerError::from(extract_key_error(&e))),
+                }
+            }
+            Ok(resp)
+        })
 }
 
 // unimplemented
